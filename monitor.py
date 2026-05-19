@@ -30,6 +30,8 @@ class DuplicatePDFHandler(FileSystemEventHandler):
         super().__init__()
         self.watch_dir = watch_dir
         self.seen_hashes = {}  # Maps file_hash -> filepath
+        self.file_to_hash = {}  # Reverse map: filepath -> file_hash
+        self._recently_processed = {}  # filepath -> timestamp, for debouncing duplicate events
         self.scan_existing_files()
 
     def scan_existing_files(self):
@@ -49,6 +51,7 @@ class DuplicatePDFHandler(FileSystemEventHandler):
                             self.remove_file(filepath)
                         else:
                             self.seen_hashes[file_hash] = filepath
+                            self.file_to_hash[filepath] = file_hash
                             
         print(f"Initial scan complete. {len(self.seen_hashes)} unique PDFs found.")
         print(f"Now monitoring '{self.watch_dir}' for new PDFs...")
@@ -67,10 +70,34 @@ class DuplicatePDFHandler(FileSystemEventHandler):
 
     def on_moved(self, event):
         # Handle cases where a file is moved/renamed into the directory
-        if not event.is_directory and event.dest_path.lower().endswith('.pdf'):
-            self.process_new_file(event.dest_path)
+        if not event.is_directory:
+            # Evict the old path from tracking so a rename isn't flagged as its own duplicate
+            if event.src_path in self.file_to_hash:
+                old_hash = self.file_to_hash.pop(event.src_path)
+                if self.seen_hashes.get(old_hash) == event.src_path:
+                    del self.seen_hashes[old_hash]
+
+            # Process the destination as a new file if it's a PDF
+            if event.dest_path.lower().endswith('.pdf'):
+                self.process_new_file(event.dest_path)
+
+    def on_deleted(self, event):
+        """Evict deleted files from the hash map so it stays in sync with the filesystem."""
+        if not event.is_directory and event.src_path in self.file_to_hash:
+            deleted_hash = self.file_to_hash.pop(event.src_path)
+            if self.seen_hashes.get(deleted_hash) == event.src_path:
+                del self.seen_hashes[deleted_hash]
+                print(f"[x] Tracked PDF removed: {os.path.basename(event.src_path)}")
 
     def process_new_file(self, filepath):
+        # Debounce: macOS FSEvents can fire multiple events for a single file copy.
+        # Skip if we already processed this exact filepath within the last 3 seconds.
+        now = time.time()
+        last_processed = self._recently_processed.get(filepath, 0)
+        if now - last_processed < 3:
+            return
+        self._recently_processed[filepath] = now
+
         print(f"[+] New PDF detected: {os.path.basename(filepath)}")
         
         # Wait slightly to ensure the file has finished writing/copying
@@ -89,6 +116,9 @@ class DuplicatePDFHandler(FileSystemEventHandler):
                 retries -= 1
             except OSError:
                 break
+
+        if retries == 0:
+            print(f"    -> Warning: '{os.path.basename(filepath)}' may still be writing. Hash may be inaccurate.")
                 
         if not os.path.exists(filepath):
             return
@@ -97,10 +127,14 @@ class DuplicatePDFHandler(FileSystemEventHandler):
         if file_hash:
             if file_hash in self.seen_hashes:
                 original_path = self.seen_hashes[file_hash]
+                # If the hash maps to the same file, it's a duplicate event, not a duplicate file
+                if os.path.abspath(original_path) == os.path.abspath(filepath):
+                    return
                 print(f"[-] Duplicate detected! '{os.path.basename(filepath)}' is a duplicate of '{os.path.basename(original_path)}'.")
                 self.remove_file(filepath)
             else:
                 self.seen_hashes[file_hash] = filepath
+                self.file_to_hash[filepath] = file_hash
                 print(f"[+] Added new unique PDF: {os.path.basename(filepath)}")
 
 
